@@ -1,0 +1,5 @@
+{
+  "name": "agent-queue",
+  "version": "0.1.0",
+  "description": "Local job queue for a dispatcher Claude and parallel worker agents: approval-gated jobs, atomic claims, ground-truth reconcile."
+}

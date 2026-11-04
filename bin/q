@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""agent-queue CLI: a local job queue for a dispatcher plus parallel worker agents.
+
+State lives in one SQLite file (default ~/.local/share/agent-queue/queue.db,
+override with AQ_HOME). Long text (briefs, findings) stays in files; the
+queue stores their paths. Claims are a single conditional UPDATE, so two
+workers can never take the same job.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tomllib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HOME = Path(os.environ.get("AQ_HOME", Path.home() / ".local/share/agent-queue"))
+DB_PATH = HOME / "queue.db"
+CONFIG_PATH = Path(os.environ.get("AQ_CONFIG", Path.home() / ".config/agent-queue/config.toml"))
+
+STATUSES = ("proposed", "approved", "claimed", "blocked", "review", "merged", "deployed", "done", "dropped")
+ACTIVE = ("claimed", "blocked")
+TYPES = ("investigate", "code", "other")
+
+MIGRATIONS = [
+    """
+    CREATE TABLE jobs (
+      id INTEGER PRIMARY KEY,
+      title TEXT NOT NULL,
+      type TEXT NOT NULL CHECK (type IN ('investigate','code','other')),
+      status TEXT NOT NULL CHECK (status IN ('proposed','approved','claimed','blocked','review','merged','deployed','done','dropped')),
+      owner TEXT,
+      worktree TEXT,
+      brief_path TEXT,
+      findings_path TEXT,
+      pr INTEGER,
+      linear TEXT,
+      source TEXT,
+      parent_id INTEGER REFERENCES jobs(id),
+      needs_vento TEXT,
+      note TEXT,
+      heartbeat_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY,
+      job_id INTEGER NOT NULL REFERENCES jobs(id),
+      at TEXT NOT NULL,
+      actor TEXT,
+      kind TEXT NOT NULL,
+      detail TEXT
+    );
+    CREATE INDEX jobs_status ON jobs(status);
+    CREATE INDEX events_job ON events(job_id);
+    """,
+]
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def config() -> dict:
+    if CONFIG_PATH.exists():
+        return tomllib.loads(CONFIG_PATH.read_text())
+    return {}
+
+
+def connect() -> sqlite3.Connection:
+    HOME.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    for index in range(version, len(MIGRATIONS)):
+        conn.executescript("BEGIN;" + MIGRATIONS[index] + f"PRAGMA user_version={index + 1}; COMMIT;")
+    return conn
+
+
+def log_event(conn, job_id: int, kind: str, detail: str | None = None, actor: str | None = None) -> None:
+    conn.execute(
+        "INSERT INTO events (job_id, at, actor, kind, detail) VALUES (?,?,?,?,?)",
+        (job_id, now(), actor or os.environ.get("AQ_ACTOR"), kind, detail),
+    )
+
+
+def row_dict(row) -> dict:
+    return {key: row[key] for key in row.keys()}
+
+
+def get_job(conn, job_id: int):
+    row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None:
+        sys.exit(f"q: no job {job_id}")
+    return row
+
+
+def emit(rows, as_json: bool) -> None:
+    rows = [row_dict(r) for r in rows]
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return
+    for r in rows:
+        flags = []
+        if r["needs_vento"]:
+            flags.append(f"NEEDS VENTO: {r['needs_vento']}")
+        if r["pr"]:
+            flags.append(f"#{r['pr']}")
+        if r["linear"]:
+            flags.append(r["linear"])
+        if r["owner"]:
+            flags.append(f"@{r['owner']}")
+        print(f"{r['id']:>4}  {r['status']:<9} {r['type']:<11} {r['title']}" + (f"  [{' | '.join(flags)}]" if flags else ""))
+
+
+def cmd_add(args) -> None:
+    conn = connect()
+    status = "approved" if args.type == "investigate" and not args.proposed else "proposed"
+    if args.approved:
+        status = "approved"
+    ts = now()
+    cur = conn.execute(
+        """INSERT INTO jobs (title, type, status, brief_path, source, parent_id, linear, note, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (args.title, args.type, status, args.brief, args.source, args.parent, args.linear, args.note, ts, ts),
+    )
+    log_event(conn, cur.lastrowid, "added", status)
+    print(cur.lastrowid)
+
+
+def cmd_approve(args) -> None:
+    conn = connect()
+    for job_id in args.ids:
+        updated = conn.execute(
+            "UPDATE jobs SET status='approved', needs_vento=NULL, updated_at=? WHERE id=? AND status='proposed' RETURNING id",
+            (now(), job_id),
+        ).fetchone()
+        if updated:
+            log_event(conn, job_id, "approved")
+            print(f"approved {job_id}")
+        else:
+            print(f"skipped {job_id} (not proposed)", file=sys.stderr)
+
+
+def cmd_claim(args) -> None:
+    conn = connect()
+    ts = now()
+    if args.id:
+        row = conn.execute(
+            """UPDATE jobs SET status='claimed', owner=?, heartbeat_at=?, updated_at=?
+               WHERE id=? AND status='approved' RETURNING *""",
+            (args.owner, ts, ts, args.id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """UPDATE jobs SET status='claimed', owner=?, heartbeat_at=?, updated_at=?
+               WHERE id=(SELECT id FROM jobs WHERE status='approved' ORDER BY id LIMIT 1) AND status='approved'
+               RETURNING *""",
+            (args.owner, ts, ts),
+        ).fetchone()
+    if row is None:
+        print("no job available", file=sys.stderr)
+        sys.exit(3)
+    log_event(conn, row["id"], "claimed", args.owner, actor=args.owner)
+    print(json.dumps(row_dict(row), indent=2))
+
+
+def cmd_update(args) -> None:
+    conn = connect()
+    get_job(conn, args.id)
+    fields = {
+        "status": args.status,
+        "worktree": args.worktree,
+        "brief_path": args.brief,
+        "findings_path": args.findings,
+        "pr": args.pr,
+        "linear": args.linear,
+        "note": args.note,
+        "needs_vento": args.needs_vento,
+        "owner": args.owner,
+    }
+    sets = {k: v for k, v in fields.items() if v is not None}
+    if args.clear_needs_vento:
+        sets["needs_vento"] = None
+    if not sets:
+        sys.exit("q update: nothing to change")
+    if "status" in sets and sets["status"] not in STATUSES:
+        sys.exit(f"q update: status must be one of {', '.join(STATUSES)}")
+    sets["updated_at"] = now()
+    if sets.get("status") in ACTIVE or "note" in sets:
+        sets["heartbeat_at"] = sets["updated_at"]
+    assignments = ", ".join(f"{k}=?" for k in sets)
+    conn.execute(f"UPDATE jobs SET {assignments} WHERE id=?", (*sets.values(), args.id))
+    log_event(conn, args.id, "updated", json.dumps({k: v for k, v in sets.items() if k != "updated_at"}))
+    print(f"updated {args.id}")
+
+
+def cmd_heartbeat(args) -> None:
+    conn = connect()
+    cwd = os.path.realpath(args.cwd or os.getcwd())
+    rows = conn.execute("SELECT id, worktree FROM jobs WHERE status IN ('claimed','blocked') AND worktree IS NOT NULL").fetchall()
+    ts = now()
+    for row in rows:
+        worktree = os.path.realpath(row["worktree"])
+        if cwd == worktree or cwd.startswith(worktree + os.sep):
+            conn.execute("UPDATE jobs SET heartbeat_at=? WHERE id=?", (ts, row["id"]))
+
+
+def cmd_list(args) -> None:
+    conn = connect()
+    where, params = [], []
+    if args.status:
+        where.append(f"status IN ({','.join('?' * len(args.status))})")
+        params.extend(args.status)
+    elif not args.all:
+        where.append("status NOT IN ('done','dropped')")
+    if args.needs_vento:
+        where.append("needs_vento IS NOT NULL")
+    sql = "SELECT * FROM jobs" + (f" WHERE {' AND '.join(where)}" if where else "") + " ORDER BY id"
+    emit(conn.execute(sql, params).fetchall(), args.json)
+
+
+def cmd_show(args) -> None:
+    conn = connect()
+    job = row_dict(get_job(conn, args.id))
+    job["events"] = [row_dict(e) for e in conn.execute("SELECT at, actor, kind, detail FROM events WHERE job_id=? ORDER BY id", (args.id,))]
+    print(json.dumps(job, indent=2))
+
+
+def cmd_release_stale(args) -> None:
+    conn = connect()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=args.minutes)
+    for row in conn.execute("SELECT * FROM jobs WHERE status='claimed'").fetchall():
+        beat = parse_ts(row["heartbeat_at"]) or parse_ts(row["updated_at"])
+        if beat and beat < cutoff:
+            conn.execute(
+                "UPDATE jobs SET status='approved', owner=NULL, updated_at=? WHERE id=? AND status='claimed'",
+                (now(), row["id"]),
+            )
+            log_event(conn, row["id"], "released_stale", f"owner {row['owner']} silent since {row['heartbeat_at']}")
+            print(f"released {row['id']} (was @{row['owner']})")
+
+
+def run(argv: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60)
+
+
+def cmd_reconcile(args) -> None:
+    """Move jobs forward from ground truth: PR state on GitHub, deploy via git ancestry."""
+    conn = connect()
+    cfg = config().get("reconcile", {})
+    repo_dir = cfg.get("repo_dir")
+    release_ref = cfg.get("release_ref")
+    if repo_dir and release_ref:
+        run(["git", "fetch", "-q", "origin", release_ref.removeprefix("origin/")], cwd=repo_dir)
+    for row in conn.execute("SELECT * FROM jobs WHERE pr IS NOT NULL AND status IN ('claimed','blocked','review','merged')").fetchall():
+        view = run(["gh", "pr", "view", str(row["pr"]), "--json", "state,isDraft,mergeCommit"], cwd=repo_dir)
+        if view.returncode != 0:
+            print(f"warn {row['id']}: gh pr view #{row['pr']} failed: {view.stderr.strip()}", file=sys.stderr)
+            continue
+        pr = json.loads(view.stdout)
+        target = row["status"]
+        if pr["state"] == "OPEN" and not pr["isDraft"] and row["status"] in ("claimed", "blocked"):
+            target = "review"
+        if pr["state"] == "MERGED":
+            target = "merged"
+            commit = (pr.get("mergeCommit") or {}).get("oid")
+            if commit and repo_dir and release_ref:
+                if run(["git", "merge-base", "--is-ancestor", commit, release_ref], cwd=repo_dir).returncode == 0:
+                    target = "deployed"
+        if pr["state"] == "CLOSED" and row["status"] != "dropped":
+            target = "blocked"
+            conn.execute("UPDATE jobs SET needs_vento=? WHERE id=?", (f"PR #{row['pr']} closed without merge", row["id"]))
+        if target != row["status"]:
+            conn.execute("UPDATE jobs SET status=?, updated_at=? WHERE id=?", (target, now(), row["id"]))
+            log_event(conn, row["id"], "reconciled", f"{row['status']} -> {target}", actor="reconcile")
+            print(f"{row['id']}: {row['status']} -> {target}")
+
+
+def cmd_gc(args) -> None:
+    """Remove worktrees of jobs finished more than --hours ago. Dry run unless --apply."""
+    conn = connect()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+    for row in conn.execute("SELECT * FROM jobs WHERE status IN ('done','dropped','deployed') AND worktree IS NOT NULL").fetchall():
+        finished = parse_ts(row["updated_at"])
+        worktree = row["worktree"]
+        if not finished or finished > cutoff or not os.path.isdir(worktree):
+            continue
+        dirty = run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=worktree)
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            print(f"keep {row['id']}: {worktree} has uncommitted changes")
+            continue
+        if not args.apply:
+            print(f"would remove {row['id']}: {worktree}")
+            continue
+        removed = run(["git", "worktree", "remove", "--force", worktree], cwd=worktree)
+        if removed.returncode == 0:
+            conn.execute("UPDATE jobs SET worktree=NULL WHERE id=?", (row["id"],))
+            log_event(conn, row["id"], "gc", f"removed {worktree}")
+            print(f"removed {row['id']}: {worktree}")
+        else:
+            print(f"failed {row['id']}: {removed.stderr.strip()}", file=sys.stderr)
+
+
+def cmd_backup(args) -> None:
+    conn = connect()
+    backups = HOME / "backups"
+    backups.mkdir(exist_ok=True)
+    target = backups / f"queue-{datetime.now(timezone.utc):%Y%m%d}.db"
+    if not target.exists():
+        dest = sqlite3.connect(target)
+        conn.backup(dest)
+        dest.close()
+        print(f"backup {target}")
+    for old in sorted(backups.glob("queue-*.db"))[: -args.keep]:
+        old.unlink()
+
+
+def cmd_board(args) -> None:
+    """Everything the dispatcher needs in one read: what needs Vento, what's stale, what moved."""
+    conn = connect()
+    rows = [row_dict(r) for r in conn.execute("SELECT * FROM jobs WHERE status NOT IN ('done','dropped') ORDER BY id")]
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(minutes=args.stale_minutes)
+    board = {
+        "generated_at": now(),
+        "needs_vento": [r for r in rows if r["needs_vento"] or r["status"] == "proposed"],
+        "stale": [r for r in rows if r["status"] in ACTIVE and (parse_ts(r["heartbeat_at"]) or stale_cutoff) < stale_cutoff],
+        "jobs": rows,
+    }
+    print(json.dumps(board, indent=2))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="q", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("add", help="add a job (investigate jobs are approved on creation)")
+    p.add_argument("--title", required=True)
+    p.add_argument("--type", choices=TYPES, required=True)
+    p.add_argument("--brief", help="path to BRIEF.md")
+    p.add_argument("--source", help="Slack/Linear/GitHub link that started this")
+    p.add_argument("--parent", type=int, help="job this was split from")
+    p.add_argument("--linear")
+    p.add_argument("--note")
+    p.add_argument("--proposed", action="store_true", help="force proposed even for investigate")
+    p.add_argument("--approved", action="store_true", help="approve on creation (dispatcher only, after Vento said yes)")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("approve", help="proposed -> approved (only after Vento's explicit yes)")
+    p.add_argument("ids", type=int, nargs="+")
+    p.set_defaults(func=cmd_approve)
+
+    p = sub.add_parser("claim", help="atomically take the oldest approved job (or --id)")
+    p.add_argument("--owner", required=True)
+    p.add_argument("--id", type=int)
+    p.set_defaults(func=cmd_claim)
+
+    p = sub.add_parser("update", help="change fields on a job")
+    p.add_argument("id", type=int)
+    p.add_argument("--status", choices=STATUSES)
+    p.add_argument("--worktree")
+    p.add_argument("--brief")
+    p.add_argument("--findings")
+    p.add_argument("--pr", type=int)
+    p.add_argument("--linear")
+    p.add_argument("--note")
+    p.add_argument("--owner")
+    p.add_argument("--needs-vento", dest="needs_vento", help="the decision you need from Vento")
+    p.add_argument("--clear-needs-vento", action="store_true")
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("heartbeat", help="touch the active job whose worktree contains --cwd")
+    p.add_argument("--cwd")
+    p.set_defaults(func=cmd_heartbeat)
+
+    p = sub.add_parser("list")
+    p.add_argument("--status", nargs="+", choices=STATUSES)
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--needs-vento", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("show")
+    p.add_argument("id", type=int)
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("release-stale", help="return claimed jobs with no heartbeat back to approved")
+    p.add_argument("--minutes", type=int, default=30)
+    p.set_defaults(func=cmd_release_stale)
+
+    p = sub.add_parser("reconcile", help="advance jobs from GitHub PR state and deploy ancestry")
+    p.set_defaults(func=cmd_reconcile)
+
+    p = sub.add_parser("gc", help="remove clean worktrees of finished jobs")
+    p.add_argument("--hours", type=int, default=24)
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_gc)
+
+    p = sub.add_parser("backup")
+    p.add_argument("--keep", type=int, default=7)
+    p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser("board", help="JSON snapshot for the dispatcher and the dashboard")
+    p.add_argument("--stale-minutes", type=int, default=30)
+    p.set_defaults(func=cmd_board)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+{
+  "name": "agent-queue",
+  "owner": { "name": "dx5v" },
+  "plugins": [{ "name": "agent-queue", "source": "./" }]
+}
