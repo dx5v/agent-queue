@@ -11,14 +11,14 @@ You do one job at a time from the queue (`bin/q` in this plugin). The dispatcher
 
 1. **Claim.** If you were given a job id: `q claim --owner <your-name> --id <id>`; otherwise `q claim --owner <your-name>`. Exit code 3 means nothing is available: stop and say so.
 2. **Register your worktree.** `q update <id> --worktree "$(pwd)" --status claimed`. A turn-end hook keeps your heartbeat fresh from then on; a job silent for 30 minutes is returned to the pool.
-3. **Read the brief** (`brief_path`). Its constraints override your defaults.
+3. **Read the brief** (`brief_path`). Its constraints and working preferences (report language, length, format) override your defaults. Re-read it after any context compaction; preferences are the first thing lost. Check the brief's premises before building on them.
 4. **Do the work.**
    - Investigate jobs: evidence first (logs, code, data), then conclusions. Mark what you verified versus inferred.
    - Code jobs: follow the repo's own guidelines (CLAUDE.md / AGENTS.md), test observable behaviour, run format, lint and typecheck for the touched packages.
 5. **Write findings** to `FINDINGS.md` from `templates/FINDINGS.md` and `q update <id> --findings <path>`.
-6. **Propose follow-ups.** Each separate piece of work you found becomes its own job with a self-contained brief: write `BRIEF-<slug>.md`, then `q add --title ... --type ... --brief <path> --parent <id>`. Read-only investigations go straight to `approved`; code, data, flag or infrastructure changes stay `proposed` until the human approves. Work that only another team can do (their production change, their infrastructure) is not a job: put it in your findings as a hand-off. Do not start follow-ups yourself.
+6. **Propose follow-ups, sparingly.** Propose a job only for work that is concrete and needed now. Ideas, maybes and "worth checking later" go in your findings under "Possible follow-ups", not into the queue. Each follow-up you do propose becomes its own job with a self-contained brief: write `BRIEF-<slug>.md`, then `q add --title ... --type ... --brief <path> --parent <id>`. Read-only investigations go straight to `approved`; code, data, flag or infrastructure changes stay `proposed` until the human approves. Work that only another team can do (their production change, their infrastructure) is not a job: put it in your findings as a hand-off. Do not start follow-ups yourself.
 7. **Finish.**
-   - Code job: open the PR, mark it ready when verified, `q update <id> --pr <number> --status review`. Never merge.
+   - Code job: open the PR, then wait for CI on the latest head. Done means every required check is green and the PR is mergeable (`gh pr checks <n>`, `gh pr view <n> --json mergeable`), not "pushed". If a check fails, fix it or, if it is unrelated infrastructure, say which check and why. Only then mark it ready when verified and `q update <id> --pr <number> --status review`. Never merge.
    - Investigate job: `q update <id> --status done`.
 8. Claim the next job, unless you were started for a single job id.
 

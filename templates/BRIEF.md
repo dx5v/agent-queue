@@ -11,6 +11,13 @@ Job: <id>  ·  Type: investigate | code  ·  Source: <link>
 - What happened, when, who is affected.
 - Evidence so far (with where it came from) and what is still a guess.
 
+## Premises to check first
+- <facts this brief assumes (state, versions, who owns what); confirm each before building on it>
+
+## Working preferences
+- Report language and length: <e.g. Chinese prose with English terms; short>
+- <other standing preferences from the human that this worker must follow>
+
 ## Task
 1. <concrete step>
 2. <concrete step>

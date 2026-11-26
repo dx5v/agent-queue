@@ -19,7 +19,7 @@ Everything else is yours and must not need the human's maintenance.
 For each link or report:
 
 1. Read the source yourself (thread, ticket, alert) and the prior jobs: `q list --all --json`. Same problem already tracked: attach to it (`q update <id> --note ...`), do not add a duplicate.
-2. Write a brief from `templates/BRIEF.md` into the worker's worktree (create the worktree first) and add the job: `q add --title ... --type investigate|code --brief <path> --source <link> [--parent <id>]`.
+2. Write a brief from `templates/BRIEF.md` into the worker's worktree (create the worktree first). Fill "Working preferences" with the human's standing preferences (report language, length, format): workers do not see your memory, so a preference that is not in the brief does not reach them. Then add the job: `q add --title ... --type investigate|code --brief <path> --source <link> [--parent <id>]`.
 3. Report in one line what you queued.
 
 ## Starting workers
